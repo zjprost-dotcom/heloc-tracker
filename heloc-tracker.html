@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HELOC Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, onValue, push, set, remove, update } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // ── PASTE YOUR FIREBASE CONFIG HERE ──────────────────────────────────────────
+  const firebaseConfig = {
+    apiKey: "AIzaSyDfq2tM9ziFaxf9Mfy1oMF3LXn3zM6K4Jk",
+    authDomain: "heloc-spend-tracker.firebaseapp.com",
+    databaseURL: "https://heloc-spend-tracker-default-rtdb.firebaseio.com",
+    projectId: "heloc-spend-tracker",
+    storageBucket: "heloc-spend-tracker.firebasestorage.app",
+    messagingSenderId: "786429375287",
+    appId: "1:786429375287:web:ca630eacf89fa14b56e0b2"
+  };
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  // ── CONSTANTS ─────────────────────────────────────────────────────────────────
+  const RATE        = 0.085;
+  const DAILY_RATE  = RATE / 365;
+  const MATURITY    = new Date("2035-02-01");
+  const CYCLE_DAY   = 15;
+
+  // ── STATE ─────────────────────────────────────────────────────────────────────
+  let transactions = [];       // sorted by date asc
+  let editingId    = null;
+
+  // ── FIREBASE LISTENER ────────────────────────────────────────────────────────
+  onValue(ref(db, "transactions"), snapshot => {
+    const raw = snapshot.val() || {};
+    transactions = Object.entries(raw)
+      .map(([id, t]) => ({ id, ...t }))
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    render();
+  });
+
+  // ── HELPERS ──────────────────────────────────────────────────────────────────
+  function fmt(n)   { return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+  function fmtD(d)  { return new Date(d + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }); }
+
+  function monthsRemaining(fromDate) {
+    const d = new Date(fromDate + "T12:00:00");
+    return (MATURITY.getFullYear() - d.getFullYear()) * 12 + (MATURITY.getMonth() - d.getMonth());
+  }
+
+  function computeBalances(upTo) {
+    let dadBal = 0, zacBal = 0;
+    const cutoff = upTo ? new Date(upTo + "T23:59:59") : new Date("9999-12-31");
+    for (const t of transactions) {
+      const td = new Date(t.date + "T12:00:00");
+      if (td > cutoff) continue;
+      const sign = t.type === "draw" ? 1 : -1;
+      if (t.person === "dad") dadBal += sign * t.amount;
+      else                     zacBal += sign * t.amount;
+    }
+    return { dadBal: Math.max(0, dadBal), zacBal: Math.max(0, zacBal) };
+  }
+
+  function dailyInterest(bal) { return bal * DAILY_RATE; }
+
+  // Running balance and accrued interest up to today
+  function computeSummary() {
+    const today = new Date();
+    let dadBal = 0, zacBal = 0;
+    let dadInterest = 0, zacInterest = 0;
+    let prevDate = null;
+
+    for (const t of transactions) {
+      const td = new Date(t.date + "T12:00:00");
+      if (prevDate) {
+        const days = Math.max(0, Math.round((td - prevDate) / 86400000));
+        dadInterest += dadBal * DAILY_RATE * days;
+        zacInterest += zacBal * DAILY_RATE * days;
+      }
+      const sign = t.type === "draw" ? 1 : -1;
+      if (t.person === "dad") dadBal = Math.max(0, dadBal + sign * t.amount);
+      else                     zacBal = Math.max(0, zacBal + sign * t.amount);
+      prevDate = td;
+    }
+
+    // Accrue from last transaction to today
+    if (prevDate) {
+      const days = Math.max(0, Math.round((today - prevDate) / 86400000));
+      dadInterest += dadBal * DAILY_RATE * days;
+      zacInterest += zacBal * DAILY_RATE * days;
+    }
+
+    const dadMonths = monthsRemaining(today.toISOString().slice(0, 10));
+    const zacMonths = dadMonths;
+
+    function suggestedPayment(bal, months) {
+      if (bal <= 0 || months <= 0) return { total: 0, interest: 0, principal: 0 };
+      const monthlyRate = RATE / 12;
+      const payment = bal * (monthlyRate * Math.pow(1 + monthlyRate, months)) / (Math.pow(1 + monthlyRate, months) - 1);
+      const interest = bal * monthlyRate;
+      return { total: payment, interest, principal: payment - interest };
+    }
+
+    return {
+      dadBal, zacBal,
+      dadInterest, zacInterest,
+      dadPayment: suggestedPayment(dadBal, dadMonths),
+      zacPayment: suggestedPayment(zacBal, zacMonths),
+      totalBal: dadBal + zacBal,
+      monthsRemaining: dadMonths,
+    };
+  }
+
+  // Billing cycle: 16th of prev month → 15th of current month
+  function currentCycleWindow() {
+    const now = new Date();
+    let cycleStart, cycleEnd;
+    if (now.getDate() > CYCLE_DAY) {
+      cycleStart = new Date(now.getFullYear(), now.getMonth(), CYCLE_DAY + 1);
+      cycleEnd   = new Date(now.getFullYear(), now.getMonth() + 1, CYCLE_DAY);
+    } else {
+      cycleStart = new Date(now.getFullYear(), now.getMonth() - 1, CYCLE_DAY + 1);
+      cycleEnd   = new Date(now.getFullYear(), now.getMonth(), CYCLE_DAY);
+    }
+    return { cycleStart, cycleEnd };
+  }
+
+  function cycleInterest() {
+    const { cycleStart, cycleEnd } = currentCycleWindow();
+    let dadBal = 0, zacBal = 0;
+    let dadInt = 0, zacInt = 0;
+    let prevDate = null;
+
+    // Start balances at cycle start
+    for (const t of transactions) {
+      const td = new Date(t.date + "T12:00:00");
+      if (td > cycleEnd) break;
+
+      if (prevDate) {
+        const from = prevDate < cycleStart ? cycleStart : prevDate;
+        const to   = td > cycleEnd ? cycleEnd : td;
+        if (to > from) {
+          const days = Math.round((to - from) / 86400000);
+          dadInt += dadBal * DAILY_RATE * days;
+          zacInt += zacBal * DAILY_RATE * days;
+        }
+      }
+
+      const sign = t.type === "draw" ? 1 : -1;
+      if (t.person === "dad") dadBal = Math.max(0, dadBal + sign * t.amount);
+      else                     zacBal = Math.max(0, zacBal + sign * t.amount);
+      prevDate = td;
+    }
+
+    // Accrue from last event to cycle end (or today if cycle not closed)
+    const accrueEnd = new Date() < cycleEnd ? new Date() : cycleEnd;
+    if (prevDate) {
+      const from = prevDate < cycleStart ? cycleStart : prevDate;
+      if (accrueEnd > from) {
+        const days = Math.round((accrueEnd - from) / 86400000);
+        dadInt += dadBal * DAILY_RATE * days;
+        zacInt += zacBal * DAILY_RATE * days;
+      }
+    }
+
+    return { dadInt, zacInt, cycleStart, cycleEnd };
+  }
+
+  // ── RENDER ────────────────────────────────────────────────────────────────────
+  function render() {
+    const s = computeSum();
+    const cy = cycleInterest();
+    renderHeader(s);
+    renderCards(s, cy);
+    renderLedger();
+    renderAmort(s);
+  }
+
+  function computeSum() { return computeSummary(); }
+
+  function renderHeader(s) {
+    document.getElementById("total-bal").textContent = "$" + fmt(s.totalBal);
+    document.getElementById("months-rem").textContent = s.monthsRemaining + " mo remaining";
+  }
+
+  function renderCards(s, cy) {
+    // Dad card
+    document.getElementById("dad-bal").textContent   = "$" + fmt(s.dadBal);
+    document.getElementById("dad-daily").textContent = "$" + fmt(dailyInterest(s.dadBal)) + "/day";
+    document.getElementById("dad-accrued").textContent = "$" + fmt(s.dadInterest);
+    document.getElementById("dad-cycle").textContent   = "$" + fmt(cy.dadInt);
+    document.getElementById("dad-payment").textContent = "$" + fmt(s.dadPayment.total);
+    document.getElementById("dad-pay-int").textContent = "$" + fmt(s.dadPayment.interest) + " int";
+    document.getElementById("dad-pay-pri").textContent = "$" + fmt(s.dadPayment.principal) + " pri";
+
+    // Zac card
+    document.getElementById("zac-bal").textContent   = "$" + fmt(s.zacBal);
+    document.getElementById("zac-daily").textContent = "$" + fmt(dailyInterest(s.zacBal)) + "/day";
+    document.getElementById("zac-accrued").textContent = "$" + fmt(s.zacInterest);
+    document.getElementById("zac-cycle").textContent   = "$" + fmt(cy.zacInt);
+    document.getElementById("zac-payment").textContent = "$" + fmt(s.zacPayment.total);
+    document.getElementById("zac-pay-int").textContent = "$" + fmt(s.zacPayment.interest) + " int";
+    document.getElementById("zac-pay-pri").textContent = "$" + fmt(s.zacPayment.principal) + " pri";
+
+    // Cycle label
+    const { cycleStart, cycleEnd } = currentCycleWindow();
+    const lbl = cycleStart.toLocaleDateString("en-US",{month:"short",day:"numeric"}) + " – " + cycleEnd.toLocaleDateString("en-US",{month:"short",day:"numeric"});
+    document.querySelectorAll(".cycle-label").forEach(el => el.textContent = lbl);
+  }
+
+  function renderLedger() {
+    const filter = document.getElementById("ledger-filter").value;
+    const tbody = document.getElementById("ledger-body");
+    tbody.innerHTML = "";
+
+    let running = { dad: 0, zac: 0 };
+    const rows = [...transactions].reverse();
+
+    for (const t of [...transactions]) {
+      const sign = t.type === "draw" ? 1 : -1;
+      if (t.person === "dad") running.dad = Math.max(0, running.dad + sign * t.amount);
+      else                     running.zac = Math.max(0, running.zac + sign * t.amount);
+    }
+
+    // Rebuild running totals forward then display reversed
+    let fwd = { dad: 0, zac: 0 };
+    const withBal = transactions.map(t => {
+      const sign = t.type === "draw" ? 1 : -1;
+      if (t.person === "dad") fwd.dad = Math.max(0, fwd.dad + sign * t.amount);
+      else                     fwd.zac = Math.max(0, fwd.zac + sign * t.amount);
+      return { ...t, runDad: fwd.dad, runZac: fwd.zac };
+    }).reverse();
+
+    for (const t of withBal) {
+      if (filter !== "all" && t.person !== filter) continue;
+      const tr = document.createElement("tr");
+      tr.dataset.id = t.id;
+      const isPerson = t.person === "dad";
+      tr.innerHTML = `
+        <td>${fmtD(t.date)}</td>
+        <td><span class="badge badge-${t.person}">${t.person === "dad" ? "Dad" : "Zac"}</span></td>
+        <td><span class="badge badge-type-${t.type}">${t.type}</span></td>
+        <td class="num ${t.type === "draw" ? "pos" : "neg"}">
+          ${t.type === "draw" ? "+" : "-"}$${fmt(t.amount)}
+        </td>
+        <td class="num muted">$${fmt(t.person === "dad" ? t.runDad : t.runZac)}</td>
+        <td class="muted note-cell">${t.note || "—"}</td>
+        <td class="actions-cell">
+          <button class="btn-icon" onclick="openEdit('${t.id}')">✎</button>
+          <button class="btn-icon danger" onclick="deleteTx('${t.id}')">✕</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    if (tbody.children.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="7" class="empty">No transactions yet.</td></tr>`;
+    }
+  }
+
+  function renderAmort(s) {
+    const container = document.getElementById("amort-content");
+    if (!container.classList.contains("open")) return;
+    renderAmortTable("dad", s.dadBal, s.monthsRemaining, "amort-dad");
+    renderAmortTable("zac", s.zacBal, s.monthsRemaining, "amort-zac");
+  }
+
+  function renderAmortTable(person, bal, months, containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    if (bal <= 0) { container.innerHTML = `<p class="muted" style="padding:16px">No balance.</p>`; return; }
+    const monthlyRate = RATE / 12;
+    const payment = bal * (monthlyRate * Math.pow(1 + monthlyRate, months)) / (Math.pow(1 + monthlyRate, months) - 1);
+    let b = bal;
+    const now = new Date();
+    let rows = "";
+    for (let i = 1; i <= months; i++) {
+      const int = b * monthlyRate;
+      const pri = payment - int;
+      b = Math.max(0, b - pri);
+      const d = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      const label = d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
+      rows += `<tr>
+        <td>${label}</td>
+        <td class="num">$${fmt(payment)}</td>
+        <td class="num muted">$${fmt(int)}</td>
+        <td class="num muted">$${fmt(pri)}</td>
+        <td class="num">$${fmt(b)}</td>
+      </tr>`;
+    }
+    container.innerHTML = `<table class="amort-table">
+      <thead><tr><th>Month</th><th>Payment</th><th>Interest</th><th>Principal</th><th>Balance</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
+  // ── CRUD ──────────────────────────────────────────────────────────────────────
+  window.addTransaction = function() {
+    const person = document.getElementById("form-person").value;
+    const type   = document.getElementById("form-type").value;
+    const date   = document.getElementById("form-date").value;
+    const amount = parseFloat(document.getElementById("form-amount").value);
+    const note   = document.getElementById("form-note").value.trim();
+
+    if (!date || isNaN(amount) || amount <= 0) {
+      alert("Please fill in date and a valid amount.");
+      return;
+    }
+
+    if (editingId) {
+      update(ref(db, "transactions/" + editingId), { person, type, date, amount, note });
+      editingId = null;
+      document.getElementById("form-submit").textContent = "Add Transaction";
+      document.getElementById("form-cancel").style.display = "none";
+    } else {
+      push(ref(db, "transactions"), { person, type, date, amount, note });
+    }
+
+    document.getElementById("form-amount").value = "";
+    document.getElementById("form-note").value   = "";
+    document.getElementById("form-date").value   = new Date().toISOString().slice(0, 10);
+  };
+
+  window.openEdit = function(id) {
+    const t = transactions.find(x => x.id === id);
+    if (!t) return;
+    editingId = id;
+    document.getElementById("form-person").value = t.person;
+    document.getElementById("form-type").value   = t.type;
+    document.getElementById("form-date").value   = t.date;
+    document.getElementById("form-amount").value = t.amount;
+    document.getElementById("form-note").value   = t.note || "";
+    document.getElementById("form-submit").textContent = "Save Changes";
+    document.getElementById("form-cancel").style.display = "inline-block";
+    document.getElementById("form-amount").focus();
+    document.querySelector(".form-section").scrollIntoView({ behavior: "smooth" });
+  };
+
+  window.cancelEdit = function() {
+    editingId = null;
+    document.getElementById("form-submit").textContent = "Add Transaction";
+    document.getElementById("form-cancel").style.display = "none";
+    document.getElementById("form-amount").value = "";
+    document.getElementById("form-note").value   = "";
+    document.getElementById("form-date").value   = new Date().toISOString().slice(0, 10);
+  };
+
+  window.deleteTx = function(id) {
+    if (!confirm("Delete this transaction?")) return;
+    remove(ref(db, "transactions/" + id));
+  };
+
+  window.toggleAmort = function() {
+    const content = document.getElementById("amort-content");
+    const btn = document.getElementById("amort-toggle");
+    content.classList.toggle("open");
+    btn.textContent = content.classList.contains("open") ? "Hide Schedule" : "Show Amortization Schedule";
+    if (content.classList.contains("open")) {
+      const s = computeSum();
+      renderAmortTable("dad", s.dadBal, s.monthsRemaining, "amort-dad");
+      renderAmortTable("zac", s.zacBal, s.monthsRemaining, "amort-zac");
+    }
+  };
+
+  window.filterLedger = function() { renderLedger(); };
+
+  // Set today's date on load
+  document.getElementById("form-date").value = new Date().toISOString().slice(0, 10);
+</script>
+
+<style>
+  :root {
+    --bg: #0e0f11;
+    --surface: #16181c;
+    --surface2: #1e2128;
+    --border: #2a2d35;
+    --accent: #c8a96e;
+    --accent2: #7eb8a4;
+    --dad: #c8a96e;
+    --zac: #7eb8a4;
+    --text: #e8e4dc;
+    --muted: #6b7080;
+    --danger: #c87070;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'DM Mono', monospace; font-size: 13px; min-height: 100vh; }
+
+  header { border-bottom: 1px solid var(--border); padding: 28px 40px 24px; display: flex; justify-content: space-between; align-items: flex-end; }
+  header h1 { font-family: 'Playfair Display', serif; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+  header p { color: var(--muted); font-size: 11px; margin-top: 4px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .header-right { text-align: right; }
+  .header-right .rate-label { color: var(--muted); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; }
+  .header-right .total-bal { font-family: 'Playfair Display', serif; font-size: 32px; color: var(--accent); letter-spacing: -1px; margin-top: 2px; }
+  .header-right .months-rem { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; margin-top: 2px; }
+
+  .content { padding: 32px 40px; display: flex; flex-direction: column; gap: 32px; }
+
+  /* CARDS */
+  .cards-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 24px; }
+  .card.dad { border-top: 3px solid var(--dad); }
+  .card.zac { border-top: 3px solid var(--zac); }
+  .card-name { font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .card-bal { font-family: 'Playfair Display', serif; font-size: 28px; letter-spacing: -0.5px; margin-bottom: 4px; }
+  .card.dad .card-bal { color: var(--dad); }
+  .card.zac .card-bal { color: var(--zac); }
+  .card-daily { color: var(--muted); font-size: 11px; margin-bottom: 16px; }
+  .card-row { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--border); }
+  .card-row-label { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .card-row-val { font-size: 13px; }
+  .card-row-sub { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .payment-row { display: flex; flex-direction: column; align-items: flex-end; }
+
+  /* FORM */
+  .form-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; }
+  .form-title { font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); margin-bottom: 16px; }
+  .form-grid { display: grid; grid-template-columns: repeat(5, 1fr) auto auto; gap: 10px; align-items: end; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .form-group input, .form-group select {
+    background: var(--surface2); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-family: 'DM Mono', monospace; font-size: 13px;
+    padding: 8px 10px; outline: none; transition: border-color 0.15s;
+  }
+  .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
+  .form-group select option { background: var(--surface2); }
+  .btn { padding: 8px 18px; border-radius: 4px; border: none; cursor: pointer; font-family: 'DM Mono', monospace; font-size: 12px; letter-spacing: 0.08em; transition: opacity 0.15s; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: var(--accent); color: #0e0f11; font-weight: 500; }
+  .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .btn-ghost:hover { border-color: var(--text); color: var(--text); }
+
+  /* LEDGER */
+  .ledger-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .ledger-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  .ledger-title { font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); }
+  .ledger-filter select { background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-family: 'DM Mono', monospace; font-size: 11px; padding: 4px 8px; outline: none; }
+  .ledger-table { width: 100%; border-collapse: collapse; }
+  .ledger-table th { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); padding: 10px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+  .ledger-table td { padding: 10px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  .ledger-table tr:last-child td { border-bottom: none; }
+  .ledger-table tr:hover td { background: var(--surface2); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--accent2); }
+  .neg { color: var(--danger); }
+  .muted { color: var(--muted); }
+  .note-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { text-align: center; color: var(--muted); padding: 32px !important; }
+  .badge { font-size: 10px; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .badge-dad { background: rgba(200,169,110,0.15); color: var(--dad); }
+  .badge-zac { background: rgba(126,184,164,0.15); color: var(--zac); }
+  .badge-type-draw    { background: rgba(126,184,164,0.12); color: var(--accent2); }
+  .badge-type-payment { background: rgba(200,112,112,0.12); color: var(--danger); }
+  .actions-cell { white-space: nowrap; }
+  .btn-icon { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 3px; padding: 2px 7px; cursor: pointer; font-size: 12px; transition: all 0.1s; }
+  .btn-icon:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-icon.danger:hover { border-color: var(--danger); color: var(--danger); }
+
+  /* AMORT */
+  .amort-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .amort-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  .amort-title { font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); }
+  #amort-content { display: none; }
+  #amort-content.open { display: block; }
+  .amort-tabs { display: grid; grid-template-columns: 1fr 1fr; }
+  .amort-tab { padding: 12px 24px; border-bottom: 1px solid var(--border); }
+  .amort-tab-label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .amort-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .amort-table th { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  .amort-table td { padding: 6px 12px; border-bottom: 1px solid rgba(42,45,53,0.5); }
+  .amort-table tr:last-child td { border-bottom: none; }
+  .amort-tab-label.dad-label { color: var(--dad); }
+  .amort-tab-label.zac-label { color: var(--zac); }
+
+  .sync-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent2); margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  @media (max-width: 700px) {
+    header { padding: 20px; flex-direction: column; gap: 12px; align-items: flex-start; }
+    .content { padding: 20px; }
+    .cards-row { grid-template-columns: 1fr; }
+    .form-grid { grid-template-columns: 1fr 1fr; }
+    .amort-tabs { grid-template-columns: 1fr; }
+    .ledger-table th:nth-child(5), .ledger-table td:nth-child(5) { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>HELOC Tracker</h1>
+    <p><span class="sync-dot"></span>Live sync · 8.50% · Matures Feb 2035</p>
+  </div>
+  <div class="header-right">
+    <div class="rate-label">Combined Balance</div>
+    <div class="total-bal" id="total-bal">—</div>
+    <div class="months-rem" id="months-rem">—</div>
+  </div>
+</header>
+
+<div class="content">
+
+  <!-- CARDS -->
+  <div class="cards-row">
+    <div class="card dad">
+      <div class="card-name">Dad</div>
+      <div class="card-bal" id="dad-bal">—</div>
+      <div class="card-daily" id="dad-daily">—</div>
+      <div class="card-row">
+        <div>
+          <div class="card-row-label">Accrued Interest (lifetime)</div>
+        </div>
+        <div id="dad-accrued">—</div>
+      </div>
+      <div class="card-row">
+        <div>
+          <div class="card-row-label">Current Cycle</div>
+          <div class="card-row-sub cycle-label"></div>
+        </div>
+        <div id="dad-cycle">—</div>
+      </div>
+      <div class="card-row">
+        <div class="card-row-label">Suggested Payment</div>
+        <div class="payment-row">
+          <div id="dad-payment">—</div>
+          <div class="card-row-sub"><span id="dad-pay-int">—</span> · <span id="dad-pay-pri">—</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="card zac">
+      <div class="card-name">Zac</div>
+      <div class="card-bal" id="zac-bal">—</div>
+      <div class="card-daily" id="zac-daily">—</div>
+      <div class="card-row">
+        <div>
+          <div class="card-row-label">Accrued Interest (lifetime)</div>
+        </div>
+        <div id="zac-accrued">—</div>
+      </div>
+      <div class="card-row">
+        <div>
+          <div class="card-row-label">Current Cycle</div>
+          <div class="card-row-sub cycle-label"></div>
+        </div>
+        <div id="zac-cycle">—</div>
+      </div>
+      <div class="card-row">
+        <div class="card-row-label">Suggested Payment</div>
+        <div class="payment-row">
+          <div id="zac-payment">—</div>
+          <div class="card-row-sub"><span id="zac-pay-int">—</span> · <span id="zac-pay-pri">—</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FORM -->
+  <div class="form-section">
+    <div class="form-title">Log Transaction</div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Person</label>
+        <select id="form-person">
+          <option value="dad">Dad</option>
+          <option value="zac">Zac</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Type</label>
+        <select id="form-type">
+          <option value="draw">Draw</option>
+          <option value="payment">Payment</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Date</label>
+        <input type="date" id="form-date">
+      </div>
+      <div class="form-group">
+        <label>Amount ($)</label>
+        <input type="number" id="form-amount" placeholder="0.00" min="0" step="0.01">
+      </div>
+      <div class="form-group">
+        <label>Note (optional)</label>
+        <input type="text" id="form-note" placeholder="e.g. kitchen draw">
+      </div>
+      <button class="btn btn-primary" id="form-submit" onclick="addTransaction()">Add</button>
+      <button class="btn btn-ghost" id="form-cancel" onclick="cancelEdit()" style="display:none">Cancel</button>
+    </div>
+  </div>
+
+  <!-- LEDGER -->
+  <div class="ledger-section">
+    <div class="ledger-header">
+      <div class="ledger-title">Transaction Ledger</div>
+      <div class="ledger-filter">
+        <select id="ledger-filter" onchange="filterLedger()">
+          <option value="all">All</option>
+          <option value="dad">Dad</option>
+          <option value="zac">Zac</option>
+        </select>
+      </div>
+    </div>
+    <table class="ledger-table">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Person</th>
+          <th>Type</th>
+          <th class="num">Amount</th>
+          <th class="num">Running Bal</th>
+          <th>Note</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="ledger-body">
+        <tr><td colspan="7" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- AMORTIZATION -->
+  <div class="amort-section">
+    <div class="amort-header">
+      <div class="amort-title">Amortization Schedule</div>
+      <button class="btn btn-ghost" id="amort-toggle" onclick="toggleAmort()">Show Amortization Schedule</button>
+    </div>
+    <div id="amort-content">
+      <div class="amort-tabs">
+        <div class="amort-tab">
+          <div class="amort-tab-label dad-label">Dad</div>
+          <div id="amort-dad"></div>
+        </div>
+        <div class="amort-tab">
+          <div class="amort-tab-label zac-label">Zac</div>
+          <div id="amort-zac"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
