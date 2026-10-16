@@ -37,24 +37,6 @@
   let recurring    = [];       // monthly rules
   let editingId    = null;
 
-  // ── FIREBASE LISTENER ────────────────────────────────────────────────────────
-  onValue(ref(db, "transactions"), snapshot => {
-    const raw = snapshot.val() || {};
-    transactions = Object.entries(raw)
-      .map(([id, t]) => ({ id, ...t }))
-      .sort((a, b) => new Date(a.date) - new Date(b.date));
-    render();
-  });
-
-  onValue(ref(db, "recurring"), snapshot => {
-    const raw = snapshot.val() || {};
-    recurring = Object.entries(raw)
-      .map(([id, r]) => ({ id, ...r }))
-      .sort((a, b) => a.day - b.day);
-    renderRecurring();
-    materializeRecurring();
-  });
-
   // ── RECURRING ────────────────────────────────────────────────────────────────
   // Local-date YYYY-MM-DD (toISOString is UTC and rolls to tomorrow in the evening)
   function localISO(d = new Date()) {
@@ -170,50 +152,61 @@
     return (MATURITY.getFullYear() - d.getFullYear()) * 12 + (MATURITY.getMonth() - d.getMonth());
   }
 
-  function computeBalances(upTo) {
-    let dadBal = 0, zacBal = 0;
-    const cutoff = upTo ? new Date(upTo + "T23:59:59") : new Date("9999-12-31");
-    for (const t of transactions) {
-      const td = new Date(t.date + "T12:00:00");
-      if (td > cutoff) continue;
-      const sign = t.type === "draw" ? 1 : -1;
-      if (t.person === "dad") dadBal += sign * t.amount;
-      else                     zacBal += sign * t.amount;
-    }
-    return { dadBal: Math.max(0, dadBal), zacBal: Math.max(0, zacBal) };
+  // Whole days between two YYYY-MM-DD strings (UTC math, immune to DST)
+  function dayDiff(a, b) {
+    const [ay, am, ad] = a.split("-").map(Number);
+    const [by, bm, bd] = b.split("-").map(Number);
+    return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
   }
 
-  function dailyInterest(bal) { return bal * DAILY_RATE; }
-
-  // Running balance and accrued interest up to today
-  function computeSummary() {
-    const today = new Date();
-    let dadBal = 0, zacBal = 0;
-    let dadInterest = 0, zacInterest = 0;
-    let prevDate = null;
-
-    for (const t of transactions) {
-      const td = new Date(t.date + "T12:00:00");
-      if (prevDate) {
-        const days = Math.max(0, Math.round((td - prevDate) / 86400000));
-        dadInterest += dadBal * DAILY_RATE * days;
-        zacInterest += zacBal * DAILY_RATE * days;
+  // ── LOAN ENGINE ──────────────────────────────────────────────────────────────
+  // Replays every transaction dated on or before asOf. Interest accrues daily on
+  // principal. A payment covers unpaid interest first; the remainder reduces
+  // principal. Transactions dated after asOf are ignored until their date arrives.
+  function simulate(asOf) {
+    const st = {
+      dad: { pri: 0, unpaid: 0, life: 0 },
+      zac: { pri: 0, unpaid: 0, life: 0 },
+    };
+    const rows = {};
+    let prev = null;
+    const accrue = to => {
+      if (prev) {
+        const days = Math.max(0, dayDiff(prev, to));
+        for (const p of ["dad", "zac"]) {
+          const i = st[p].pri * DAILY_RATE * days;
+          st[p].unpaid += i;
+          st[p].life   += i;
+        }
       }
-      const sign = t.type === "draw" ? 1 : -1;
-      if (t.person === "dad") dadBal = Math.max(0, dadBal + sign * t.amount);
-      else                     zacBal = Math.max(0, zacBal + sign * t.amount);
-      prevDate = td;
+      prev = to;
+    };
+    for (const t of transactions) {
+      if (t.date > asOf) break;              // sorted ascending
+      accrue(t.date);
+      const s = st[t.person === "dad" ? "dad" : "zac"];
+      let intPaid = 0, priPaid = 0, excess = 0;
+      if (t.type === "draw") {
+        s.pri += t.amount;
+      } else {
+        intPaid = Math.min(t.amount, s.unpaid);
+        s.unpaid -= intPaid;
+        priPaid = Math.min(t.amount - intPaid, s.pri);
+        s.pri -= priPaid;
+        excess = t.amount - intPaid - priPaid;
+      }
+      rows[t.id] = { intPaid, priPaid, excess, bal: s.pri + s.unpaid };
     }
+    accrue(asOf);
+    return { st, rows };
+  }
 
-    // Accrue from last transaction to today
-    if (prevDate) {
-      const days = Math.max(0, Math.round((today - prevDate) / 86400000));
-      dadInterest += dadBal * DAILY_RATE * days;
-      zacInterest += zacBal * DAILY_RATE * days;
-    }
+  function dailyInterest(principal) { return principal * DAILY_RATE; }
 
-    const dadMonths = monthsRemaining(today.toISOString().slice(0, 10));
-    const zacMonths = dadMonths;
+  function computeSummary() {
+    const today = localISO();
+    const { st, rows } = simulate(today);
+    const months = monthsRemaining(today);
 
     function suggestedPayment(bal, months) {
       if (bal <= 0 || months <= 0) return { total: 0, interest: 0, principal: 0 };
@@ -223,13 +216,18 @@
       return { total: payment, interest, principal: payment - interest };
     }
 
+    const dadBal = st.dad.pri + st.dad.unpaid;
+    const zacBal = st.zac.pri + st.zac.unpaid;
     return {
+      rows,
       dadBal, zacBal,
-      dadInterest, zacInterest,
-      dadPayment: suggestedPayment(dadBal, dadMonths),
-      zacPayment: suggestedPayment(zacBal, zacMonths),
+      dadPri: st.dad.pri, zacPri: st.zac.pri,
+      dadUnpaid: st.dad.unpaid, zacUnpaid: st.zac.unpaid,
+      dadInterest: st.dad.life, zacInterest: st.zac.life,
+      dadPayment: suggestedPayment(dadBal, months),
+      zacPayment: suggestedPayment(zacBal, months),
       totalBal: dadBal + zacBal,
-      monthsRemaining: dadMonths,
+      monthsRemaining: months,
     };
   }
 
@@ -247,45 +245,21 @@
     return { cycleStart, cycleEnd };
   }
 
+  // Interest charged so far this cycle = lifetime interest at (today or cycle end)
+  // minus lifetime interest at cycle start.
   function cycleInterest() {
     const { cycleStart, cycleEnd } = currentCycleWindow();
-    let dadBal = 0, zacBal = 0;
-    let dadInt = 0, zacInt = 0;
-    let prevDate = null;
-
-    // Start balances at cycle start
-    for (const t of transactions) {
-      const td = new Date(t.date + "T12:00:00");
-      if (td > cycleEnd) break;
-
-      if (prevDate) {
-        const from = prevDate < cycleStart ? cycleStart : prevDate;
-        const to   = td > cycleEnd ? cycleEnd : td;
-        if (to > from) {
-          const days = Math.round((to - from) / 86400000);
-          dadInt += dadBal * DAILY_RATE * days;
-          zacInt += zacBal * DAILY_RATE * days;
-        }
-      }
-
-      const sign = t.type === "draw" ? 1 : -1;
-      if (t.person === "dad") dadBal = Math.max(0, dadBal + sign * t.amount);
-      else                     zacBal = Math.max(0, zacBal + sign * t.amount);
-      prevDate = td;
-    }
-
-    // Accrue from last event to cycle end (or today if cycle not closed)
-    const accrueEnd = new Date() < cycleEnd ? new Date() : cycleEnd;
-    if (prevDate) {
-      const from = prevDate < cycleStart ? cycleStart : prevDate;
-      if (accrueEnd > from) {
-        const days = Math.round((accrueEnd - from) / 86400000);
-        dadInt += dadBal * DAILY_RATE * days;
-        zacInt += zacBal * DAILY_RATE * days;
-      }
-    }
-
-    return { dadInt, zacInt, cycleStart, cycleEnd };
+    const start = localISO(cycleStart);
+    const today = localISO();
+    const endISO = localISO(cycleEnd);
+    const end = today < endISO ? today : endISO;
+    if (end <= start) return { dadInt: 0, zacInt: 0, cycleStart, cycleEnd };
+    const a = simulate(start).st, b = simulate(end).st;
+    return {
+      dadInt: b.dad.life - a.dad.life,
+      zacInt: b.zac.life - a.zac.life,
+      cycleStart, cycleEnd,
+    };
   }
 
   // ── RENDER ────────────────────────────────────────────────────────────────────
@@ -294,7 +268,7 @@
     const cy = cycleInterest();
     renderHeader(s);
     renderCards(s, cy);
-    renderLedger();
+    renderLedger(s);
     renderAmort(s);
   }
 
@@ -308,8 +282,9 @@
   function renderCards(s, cy) {
     // Dad card
     document.getElementById("dad-bal").textContent   = "$" + fmt(s.dadBal);
-    document.getElementById("dad-daily").textContent = "$" + fmt(dailyInterest(s.dadBal)) + "/day";
-    document.getElementById("dad-accrued").textContent = "$" + fmt(s.dadInterest);
+    document.getElementById("dad-daily").textContent = "$" + fmt(dailyInterest(s.dadPri)) + "/day on $" + fmt(s.dadPri) + " principal";
+    document.getElementById("dad-unpaid").textContent = "$" + fmt(s.dadUnpaid);
+    document.getElementById("dad-lifetime").textContent = "lifetime $" + fmt(s.dadInterest);
     document.getElementById("dad-cycle").textContent   = "$" + fmt(cy.dadInt);
     document.getElementById("dad-payment").textContent = "$" + fmt(s.dadPayment.total);
     document.getElementById("dad-pay-int").textContent = "$" + fmt(s.dadPayment.interest) + " int";
@@ -317,8 +292,9 @@
 
     // Zac card
     document.getElementById("zac-bal").textContent   = "$" + fmt(s.zacBal);
-    document.getElementById("zac-daily").textContent = "$" + fmt(dailyInterest(s.zacBal)) + "/day";
-    document.getElementById("zac-accrued").textContent = "$" + fmt(s.zacInterest);
+    document.getElementById("zac-daily").textContent = "$" + fmt(dailyInterest(s.zacPri)) + "/day on $" + fmt(s.zacPri) + " principal";
+    document.getElementById("zac-unpaid").textContent = "$" + fmt(s.zacUnpaid);
+    document.getElementById("zac-lifetime").textContent = "lifetime $" + fmt(s.zacInterest);
     document.getElementById("zac-cycle").textContent   = "$" + fmt(cy.zacInt);
     document.getElementById("zac-payment").textContent = "$" + fmt(s.zacPayment.total);
     document.getElementById("zac-pay-int").textContent = "$" + fmt(s.zacPayment.interest) + " int";
@@ -330,33 +306,19 @@
     document.querySelectorAll(".cycle-label").forEach(el => el.textContent = lbl);
   }
 
-  function renderLedger() {
+  function renderLedger(s = computeSum()) {
     const filter = document.getElementById("ledger-filter").value;
     const tbody = document.getElementById("ledger-body");
     tbody.innerHTML = "";
 
-    let running = { dad: 0, zac: 0 };
-    const rows = [...transactions].reverse();
-
-    for (const t of [...transactions]) {
-      const sign = t.type === "draw" ? 1 : -1;
-      if (t.person === "dad") running.dad = Math.max(0, running.dad + sign * t.amount);
-      else                     running.zac = Math.max(0, running.zac + sign * t.amount);
-    }
-
-    // Rebuild running totals forward then display reversed
-    let fwd = { dad: 0, zac: 0 };
-    const withBal = transactions.map(t => {
-      const sign = t.type === "draw" ? 1 : -1;
-      if (t.person === "dad") fwd.dad = Math.max(0, fwd.dad + sign * t.amount);
-      else                     fwd.zac = Math.max(0, fwd.zac + sign * t.amount);
-      return { ...t, runDad: fwd.dad, runZac: fwd.zac };
-    }).reverse();
+    const withBal = [...transactions].reverse();
 
     for (const t of withBal) {
       if (filter !== "all" && t.person !== filter) continue;
+      const r = s.rows[t.id];               // undefined → dated in the future
       const tr = document.createElement("tr");
       tr.dataset.id = t.id;
+      if (!r) tr.classList.add("future");
       const isPerson = t.person === "dad";
       tr.innerHTML = `
         <td>${fmtD(t.date)}</td>
@@ -364,8 +326,9 @@
         <td><span class="badge badge-type-${t.type}">${t.type}</span></td>
         <td class="num ${t.type === "draw" ? "pos" : "neg"}">
           ${t.type === "draw" ? "+" : "-"}$${fmt(t.amount)}
+          ${r && t.type === "payment" ? `<div class="split">$${fmt(r.intPaid)} int · $${fmt(r.priPaid)} pri${r.excess > 0.005 ? ` · $${fmt(r.excess)} over` : ""}</div>` : ""}
         </td>
-        <td class="num muted">$${fmt(t.person === "dad" ? t.runDad : t.runZac)}</td>
+        <td class="num muted">${r ? "$" + fmt(r.bal) : "scheduled"}</td>
         <td class="muted note-cell">${t.recurringId ? '<span title="Monthly" style="color:var(--accent)">↻</span> ' : ""}${t.note || "—"}</td>
         <td class="actions-cell">
           <button class="btn-icon" onclick="openEdit('${t.id}')">✎</button>
@@ -508,6 +471,24 @@
 
   // Set today's date on load
   document.getElementById("form-date").value = localISO();
+
+  // ── FIREBASE LISTENER ────────────────────────────────────────────────────────
+  onValue(ref(db, "transactions"), snapshot => {
+    const raw = snapshot.val() || {};
+    transactions = Object.entries(raw)
+      .map(([id, t]) => ({ id, ...t }))
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    render();
+  });
+
+  onValue(ref(db, "recurring"), snapshot => {
+    const raw = snapshot.val() || {};
+    recurring = Object.entries(raw)
+      .map(([id, r]) => ({ id, ...r }))
+      .sort((a, b) => a.day - b.day);
+    renderRecurring();
+    materializeRecurring();
+  });
 </script>
 
 <style>
@@ -591,6 +572,8 @@
   .pos { color: var(--accent2); }
   .neg { color: var(--danger); }
   .muted { color: var(--muted); }
+  .split { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .ledger-table tr.future td { opacity: 0.5; }
   .note-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { text-align: center; color: var(--muted); padding: 32px !important; }
   .badge { font-size: 10px; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.08em; text-transform: uppercase; }
@@ -659,9 +642,10 @@
       <div class="card-daily" id="dad-daily">—</div>
       <div class="card-row">
         <div>
-          <div class="card-row-label">Accrued Interest (lifetime)</div>
+          <div class="card-row-label">Unpaid Interest</div>
+          <div class="card-row-sub" id="dad-lifetime">—</div>
         </div>
-        <div id="dad-accrued">—</div>
+        <div id="dad-unpaid">—</div>
       </div>
       <div class="card-row">
         <div>
@@ -684,9 +668,10 @@
       <div class="card-daily" id="zac-daily">—</div>
       <div class="card-row">
         <div>
-          <div class="card-row-label">Accrued Interest (lifetime)</div>
+          <div class="card-row-label">Unpaid Interest</div>
+          <div class="card-row-sub" id="zac-lifetime">—</div>
         </div>
-        <div id="zac-accrued">—</div>
+        <div id="zac-unpaid">—</div>
       </div>
       <div class="card-row">
         <div>
@@ -791,7 +776,7 @@
           <th>Person</th>
           <th>Type</th>
           <th class="num">Amount</th>
-          <th class="num">Running Bal</th>
+          <th class="num">Balance Owed</th>
           <th>Note</th>
           <th></th>
         </tr>
