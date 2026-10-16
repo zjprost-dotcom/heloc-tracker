@@ -34,6 +34,7 @@
 
   // ── STATE ─────────────────────────────────────────────────────────────────────
   let transactions = [];       // sorted by date asc
+  let recurring    = [];       // monthly rules
   let editingId    = null;
 
   // ── FIREBASE LISTENER ────────────────────────────────────────────────────────
@@ -44,6 +45,121 @@
       .sort((a, b) => new Date(a.date) - new Date(b.date));
     render();
   });
+
+  onValue(ref(db, "recurring"), snapshot => {
+    const raw = snapshot.val() || {};
+    recurring = Object.entries(raw)
+      .map(([id, r]) => ({ id, ...r }))
+      .sort((a, b) => a.day - b.day);
+    renderRecurring();
+    materializeRecurring();
+  });
+
+  // ── RECURRING ────────────────────────────────────────────────────────────────
+  // Local-date YYYY-MM-DD (toISOString is UTC and rolls to tomorrow in the evening)
+  function localISO(d = new Date()) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+  // Day-of-month clamped to month length (31st → Feb 28/29, Apr 30, …)
+  function occurrenceDate(y, m, day) {
+    const last = new Date(y, m + 1, 0).getDate();
+    return localISO(new Date(y, m, Math.min(day, last)));
+  }
+
+  // Yields not-yet-posted occurrences of a rule in order: { key: "YYYY-MM", date }
+  function* occurrences(r) {
+    let y, m;
+    if (r.lastPosted) {
+      const [ly, lm] = r.lastPosted.split("-").map(Number);
+      y = ly; m = lm;                       // lm is 1-based → this is the following month, 0-based
+    } else {
+      const s = new Date(r.startDate + "T12:00:00");
+      y = s.getFullYear(); m = s.getMonth();
+    }
+    for (let i = 0; i < 1200; i++) {
+      while (m > 11) { m -= 12; y++; }
+      const date = occurrenceDate(y, m, r.day);
+      if (r.endDate && date > r.endDate) return;
+      if (date >= r.startDate) yield { key: `${y}-${String(m + 1).padStart(2, "0")}`, date };
+      m++;
+    }
+  }
+
+  function nextOccurrence(r) {
+    const today = localISO();
+    for (const o of occurrences(r)) if (o.date > today) return o.date;
+    return null;
+  }
+
+  // Post every occurrence dated today or earlier. Deterministic IDs make this
+  // safe if two people have the app open at once; lastPosted keeps a deleted
+  // entry from being re-created.
+  let materializing = false;
+  async function materializeRecurring() {
+    if (materializing) return;
+    materializing = true;
+    try {
+      const today = localISO();
+      for (const r of recurring) {
+        if (r.active === false) continue;
+        const due = [];
+        for (const o of occurrences(r)) { if (o.date > today) break; due.push(o); }
+        if (!due.length) continue;
+        const updates = {};
+        for (const o of due) {
+          updates[`transactions/rec_${r.id}_${o.key}`] = {
+            person: r.person, type: r.type, amount: r.amount,
+            date: o.date, note: r.note || "", recurringId: r.id,
+          };
+        }
+        updates[`recurring/${r.id}/lastPosted`] = due[due.length - 1].key;
+        await update(ref(db), updates);
+      }
+    } catch (e) {
+      console.error("Recurring post failed:", e);
+    } finally {
+      materializing = false;
+    }
+  }
+
+  function ordinal(n) {
+    const s = ["th", "st", "nd", "rd"], v = n % 100;
+    return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+
+  function renderRecurring() {
+    const section = document.getElementById("recurring-section");
+    const tbody   = document.getElementById("recurring-body");
+    const active  = recurring.filter(r => r.active !== false);
+    section.style.display = active.length ? "block" : "none";
+    tbody.innerHTML = "";
+    for (const r of active) {
+      const next = nextOccurrence(r);
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${ordinal(r.day)}${r.day > 28 ? '<span class="muted"> / last</span>' : ""}</td>
+        <td><span class="badge badge-${r.person}">${r.person === "dad" ? "Dad" : "Zac"}</span></td>
+        <td><span class="badge badge-type-${r.type}">${r.type}</span></td>
+        <td class="num ${r.type === "draw" ? "pos" : "neg"}">${r.type === "draw" ? "+" : "-"}$${fmt(r.amount)}</td>
+        <td class="muted">${next ? fmtD(next) : "Ended"}</td>
+        <td class="muted">${r.endDate ? fmtD(r.endDate) : "No end"}</td>
+        <td class="muted note-cell">${r.note || "—"}</td>
+        <td class="actions-cell"><button class="btn-icon danger" title="Stop" onclick="stopRecurring('${r.id}')">✕</button></td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  window.stopRecurring = function(id) {
+    if (!confirm("Stop this monthly transaction? Entries already posted stay in the ledger.")) return;
+    remove(ref(db, "recurring/" + id));
+  };
+
+  window.toggleRepeat = function() {
+    const on = document.getElementById("form-repeat").checked;
+    document.getElementById("repeat-until-group").style.display = on ? "flex" : "none";
+    document.getElementById("form-submit").textContent = on ? "Add Monthly" : "Add";
+  };
 
   // ── HELPERS ──────────────────────────────────────────────────────────────────
   function fmt(n)   { return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
@@ -250,7 +366,7 @@
           ${t.type === "draw" ? "+" : "-"}$${fmt(t.amount)}
         </td>
         <td class="num muted">$${fmt(t.person === "dad" ? t.runDad : t.runZac)}</td>
-        <td class="muted note-cell">${t.note || "—"}</td>
+        <td class="muted note-cell">${t.recurringId ? '<span title="Monthly" style="color:var(--accent)">↻</span> ' : ""}${t.note || "—"}</td>
         <td class="actions-cell">
           <button class="btn-icon" onclick="openEdit('${t.id}')">✎</button>
           <button class="btn-icon danger" onclick="deleteTx('${t.id}')">✕</button>
@@ -313,18 +429,34 @@
       return;
     }
 
+    const repeat = !editingId && document.getElementById("form-repeat").checked;
+    const until  = document.getElementById("form-until").value;
+
+    if (repeat && until && until < date) {
+      alert("The end date must be on or after the first posting date.");
+      return;
+    }
+
     if (editingId) {
       update(ref(db, "transactions/" + editingId), { person, type, date, amount, note });
       editingId = null;
-      document.getElementById("form-submit").textContent = "Add Transaction";
+      document.getElementById("form-submit").textContent = "Add";
       document.getElementById("form-cancel").style.display = "none";
+      document.getElementById("repeat-row").style.display = "flex";
+    } else if (repeat) {
+      const rule = { person, type, amount, note, startDate: date, day: parseInt(date.slice(8, 10), 10), active: true };
+      if (until) rule.endDate = until;
+      push(ref(db, "recurring"), rule);   // listener posts any occurrence due today or earlier
+      document.getElementById("form-repeat").checked = false;
+      document.getElementById("form-until").value = "";
+      toggleRepeat();
     } else {
       push(ref(db, "transactions"), { person, type, date, amount, note });
     }
 
     document.getElementById("form-amount").value = "";
     document.getElementById("form-note").value   = "";
-    document.getElementById("form-date").value   = new Date().toISOString().slice(0, 10);
+    document.getElementById("form-date").value   = localISO();
   };
 
   window.openEdit = function(id) {
@@ -338,17 +470,21 @@
     document.getElementById("form-note").value   = t.note || "";
     document.getElementById("form-submit").textContent = "Save Changes";
     document.getElementById("form-cancel").style.display = "inline-block";
+    document.getElementById("form-repeat").checked = false;
+    document.getElementById("repeat-until-group").style.display = "none";
+    document.getElementById("repeat-row").style.display = "none";
     document.getElementById("form-amount").focus();
     document.querySelector(".form-section").scrollIntoView({ behavior: "smooth" });
   };
 
   window.cancelEdit = function() {
     editingId = null;
-    document.getElementById("form-submit").textContent = "Add Transaction";
+    document.getElementById("form-submit").textContent = "Add";
     document.getElementById("form-cancel").style.display = "none";
+    document.getElementById("repeat-row").style.display = "flex";
     document.getElementById("form-amount").value = "";
     document.getElementById("form-note").value   = "";
-    document.getElementById("form-date").value   = new Date().toISOString().slice(0, 10);
+    document.getElementById("form-date").value   = localISO();
   };
 
   window.deleteTx = function(id) {
@@ -371,7 +507,7 @@
   window.filterLedger = function() { renderLedger(); };
 
   // Set today's date on load
-  document.getElementById("form-date").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("form-date").value = localISO();
 </script>
 
 <style>
@@ -437,6 +573,10 @@
   .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
   .btn-ghost:hover { border-color: var(--text); color: var(--text); }
 
+  .repeat-row { display: flex; gap: 20px; align-items: flex-end; margin-top: 14px; flex-wrap: wrap; }
+  .repeat-check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; cursor: pointer; padding-bottom: 9px; }
+  .repeat-check input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
+
   /* LEDGER */
   .ledger-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
   .ledger-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid var(--border); }
@@ -489,6 +629,9 @@
     .form-grid { grid-template-columns: 1fr 1fr; }
     .amort-tabs { grid-template-columns: 1fr; }
     .ledger-table th:nth-child(5), .ledger-table td:nth-child(5) { display: none; }
+    #recurring-section .ledger-table th:nth-child(5), #recurring-section .ledger-table td:nth-child(5) { display: table-cell; }
+    #recurring-section .ledger-table th:nth-child(6), #recurring-section .ledger-table td:nth-child(6),
+    #recurring-section .ledger-table th:nth-child(7), #recurring-section .ledger-table td:nth-child(7) { display: none; }
   }
 </style>
 </head>
@@ -595,6 +738,38 @@
       <button class="btn btn-primary" id="form-submit" onclick="addTransaction()">Add</button>
       <button class="btn btn-ghost" id="form-cancel" onclick="cancelEdit()" style="display:none">Cancel</button>
     </div>
+    <div class="repeat-row" id="repeat-row">
+      <label class="repeat-check">
+        <input type="checkbox" id="form-repeat" onchange="toggleRepeat()">
+        Repeat monthly on this date
+      </label>
+      <div class="form-group" id="repeat-until-group" style="display:none">
+        <label>Until (optional)</label>
+        <input type="date" id="form-until">
+      </div>
+    </div>
+  </div>
+
+  <!-- RECURRING -->
+  <div class="ledger-section" id="recurring-section" style="display:none">
+    <div class="ledger-header">
+      <div class="ledger-title">Monthly Transactions</div>
+    </div>
+    <table class="ledger-table">
+      <thead>
+        <tr>
+          <th>Day</th>
+          <th>Person</th>
+          <th>Type</th>
+          <th class="num">Amount</th>
+          <th>Next</th>
+          <th>Ends</th>
+          <th>Note</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="recurring-body"></tbody>
+    </table>
   </div>
 
   <!-- LEDGER -->
