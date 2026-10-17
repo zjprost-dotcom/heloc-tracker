@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HELOC Tracker</title>
+<script>
+  try { const t = localStorage.getItem("heloc-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Playfair+Display:wght@400;700&display=swap" rel="stylesheet">
 
 <!-- Firebase SDK -->
@@ -502,10 +505,46 @@
     --dad: #c8a96e;
     --zac: #7eb8a4;
     --text: #e8e4dc;
-    --muted: #6b7080;
+    --muted: #7a7f8e;
     --danger: #c87070;
+    --on-accent: #0e0f11;
     --radius: 8px;
+    color-scheme: dark;
   }
+  /* Light: follows the system unless the toggle picked a theme */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f5f2eb;
+      --surface: #ffffff;
+      --surface2: #f1ede4;
+      --border: #e1dbcf;
+      --accent: #95722f;
+      --accent2: #2f7d65;
+      --dad: #95722f;
+      --zac: #2f7d65;
+      --text: #1d1e22;
+      --muted: #6a6e78;
+      --danger: #b04545;
+      --on-accent: #ffffff;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f2eb;
+    --surface: #ffffff;
+    --surface2: #f1ede4;
+    --border: #e1dbcf;
+    --accent: #95722f;
+    --accent2: #2f7d65;
+    --dad: #95722f;
+    --zac: #2f7d65;
+    --text: #1d1e22;
+    --muted: #6a6e78;
+    --danger: #b04545;
+    --on-accent: #ffffff;
+    color-scheme: light;
+  }
+  body { transition: background-color 0.2s, color 0.2s; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'DM Mono', monospace; font-size: 13px; min-height: 100vh; }
 
@@ -513,6 +552,9 @@
   header h1 { font-family: 'Playfair Display', serif; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
   header p { color: var(--muted); font-size: 11px; margin-top: 4px; letter-spacing: 0.08em; text-transform: uppercase; }
   .header-right { text-align: right; }
+  .header-left { display: flex; align-items: flex-start; gap: 16px; }
+  .theme-toggle { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 50%; width: 30px; height: 30px; cursor: pointer; font-size: 14px; line-height: 1; margin-top: 4px; transition: all 0.15s; flex-shrink: 0; }
+  .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
   .header-right .rate-label { color: var(--muted); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; }
   .header-right .total-bal { font-family: 'Playfair Display', serif; font-size: 32px; color: var(--accent); letter-spacing: -1px; margin-top: 2px; }
   .header-right .months-rem { color: var(--muted); font-size: 10px; letter-spacing: 0.08em; margin-top: 2px; }
@@ -550,7 +592,7 @@
   .form-group select option { background: var(--surface2); }
   .btn { padding: 8px 18px; border-radius: 4px; border: none; cursor: pointer; font-family: 'DM Mono', monospace; font-size: 12px; letter-spacing: 0.08em; transition: opacity 0.15s; }
   .btn:hover { opacity: 0.85; }
-  .btn-primary { background: var(--accent); color: #0e0f11; font-weight: 500; }
+  .btn-primary { background: var(--accent); color: var(--on-accent); font-weight: 500; }
   .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
   .btn-ghost:hover { border-color: var(--text); color: var(--text); }
 
@@ -577,10 +619,10 @@
   .note-cell { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { text-align: center; color: var(--muted); padding: 32px !important; }
   .badge { font-size: 10px; padding: 2px 8px; border-radius: 3px; letter-spacing: 0.08em; text-transform: uppercase; }
-  .badge-dad { background: rgba(200,169,110,0.15); color: var(--dad); }
-  .badge-zac { background: rgba(126,184,164,0.15); color: var(--zac); }
-  .badge-type-draw    { background: rgba(126,184,164,0.12); color: var(--accent2); }
-  .badge-type-payment { background: rgba(200,112,112,0.12); color: var(--danger); }
+  .badge-dad { background: color-mix(in srgb, var(--dad) 15%, transparent); color: var(--dad); }
+  .badge-zac { background: color-mix(in srgb, var(--zac) 15%, transparent); color: var(--zac); }
+  .badge-type-draw    { background: color-mix(in srgb, var(--accent2) 12%, transparent); color: var(--accent2); }
+  .badge-type-payment { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
   .actions-cell { white-space: nowrap; }
   .btn-icon { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 3px; padding: 2px 7px; cursor: pointer; font-size: 12px; transition: all 0.1s; }
   .btn-icon:hover { border-color: var(--accent); color: var(--accent); }
@@ -597,7 +639,7 @@
   .amort-tab-label { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
   .amort-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .amort-table th { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
-  .amort-table td { padding: 6px 12px; border-bottom: 1px solid rgba(42,45,53,0.5); }
+  .amort-table td { padding: 6px 12px; border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
   .amort-table tr:last-child td { border-bottom: none; }
   .amort-tab-label.dad-label { color: var(--dad); }
   .amort-tab-label.zac-label { color: var(--zac); }
@@ -621,9 +663,12 @@
 <body>
 
 <header>
-  <div>
+  <div class="header-left">
+   <div>
     <h1>HELOC Tracker</h1>
     <p><span class="sync-dot"></span>Live sync · 8.50% · Matures Feb 2035</p>
+   </div>
+   <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Switch theme" aria-label="Switch light/dark theme"></button>
   </div>
   <div class="header-right">
     <div class="rate-label">Combined Balance</div>
@@ -808,5 +853,22 @@
   </div>
 
 </div>
+<script>
+  function currentTheme() {
+    return document.documentElement.dataset.theme ||
+      (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+  }
+  function syncThemeIcon() {
+    document.getElementById("theme-toggle").textContent = currentTheme() === "dark" ? "☀" : "☾";
+  }
+  function toggleTheme() {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("heloc-theme", next); } catch (e) {}
+    syncThemeIcon();
+  }
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", syncThemeIcon);
+  syncThemeIcon();
+</script>
 </body>
 </html>
